@@ -51,6 +51,10 @@ services:
       - MEDIA_JOBS=${MEDIA_JOBS:-all}
     volumes:
       - processor-data:/tmp/tg-s3
+      # The Local Bot API (--local) returns file paths on its own disk instead of serving files over HTTP,
+      # so the processor reads them from the same volume, mounted at the same path, read-only.
+      # To reuse an existing Bot API server, mount its data directory here at the path it uses.
+      - tg-bot-api-data:/var/lib/telegram-bot-api:ro
     deploy:
       resources:
         limits:

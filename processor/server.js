@@ -2,7 +2,7 @@ import express from 'express';
 import { createReadStream, createWriteStream, unlinkSync, existsSync, mkdirSync, openAsBlob } from 'fs';
 import { readFile, writeFile, unlink, stat, open as openFile } from 'fs/promises';
 import { createDecipheriv, createCipheriv, randomUUID, randomBytes, createHash, timingSafeEqual } from 'crypto';
-import { join } from 'path';
+import { join, isAbsolute } from 'path';
 import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
 import { execFile } from 'child_process';
@@ -107,9 +107,7 @@ app.get('/api/jobs/:id', (req, res) => {
 app.post('/api/proxy/get', async (req, res) => {
   try {
     const { file_id } = req.body;
-    const filePath = await getFilePath(file_id);
-    const url = `${TG_API}/file/bot${BOT_TOKEN}/${filePath}`;
-    const tgRes = await fetch(url, { signal: AbortSignal.timeout(TIMEOUT_TRANSFER) });
+    const tgRes = await fetchTgFile(file_id);
     if (!tgRes.ok) return res.status(502).json({ error: `TG download failed: ${tgRes.status}` });
 
     res.set('Content-Type', tgRes.headers.get('content-type') || 'application/octet-stream');
@@ -198,13 +196,7 @@ app.post('/api/proxy/put', async (req, res) => {
 app.post('/api/proxy/range', async (req, res) => {
   try {
     const { file_id, start, end } = req.body;
-    const filePath = await getFilePath(file_id);
-    const url = `${TG_API}/file/bot${BOT_TOKEN}/${filePath}`;
-
-    const tgRes = await fetch(url, {
-      headers: { 'Range': `bytes=${start}-${end}` },
-      signal: AbortSignal.timeout(TIMEOUT_TRANSFER),
-    });
+    const tgRes = await fetchTgFile(file_id, { start, end });
 
     res.status(tgRes.status);
     res.set('Content-Type', tgRes.headers.get('content-type') || 'application/octet-stream');
@@ -363,9 +355,7 @@ app.post('/api/proxy/get-decrypt', async (req, res) => {
     }
 
     // 1. Download encrypted file from TG to temp file (streaming, no memory buffering)
-    const filePath = await getFilePath(file_id);
-    const url = `${TG_API}/file/bot${BOT_TOKEN}/${filePath}`;
-    const tgRes = await fetch(url, { signal: AbortSignal.timeout(TIMEOUT_TRANSFER) });
+    const tgRes = await fetchTgFile(file_id);
     if (!tgRes.ok) return res.status(502).json({ error: `TG download failed: ${tgRes.status}` });
 
     const ws = createWriteStream(encPath);
@@ -457,9 +447,7 @@ app.post('/api/proxy/consolidate', async (req, res) => {
     const writeError = new Promise((_, reject) => writeStream.on('error', reject));
 
     for (const fileId of file_ids) {
-      const filePath = await getFilePath(fileId);
-      const url = `${TG_API}/file/bot${BOT_TOKEN}/${filePath}`;
-      const tgRes = await fetch(url, { signal: AbortSignal.timeout(TIMEOUT_TRANSFER) });
+      const tgRes = await fetchTgFile(fileId);
       if (!tgRes.ok) throw new Error(`Download part failed: ${tgRes.status}`);
 
       const reader = tgRes.body.getReader();
@@ -537,9 +525,7 @@ app.post('/api/proxy/consolidate', async (req, res) => {
 app.get('/api/image/resize', async (req, res) => {
   try {
     const { tg_file_id, width, format, quality } = req.query;
-    const filePath = await getFilePath(tg_file_id);
-    const url = `${TG_API}/file/bot${BOT_TOKEN}/${filePath}`;
-    const tgRes = await fetch(url, { signal: AbortSignal.timeout(TIMEOUT_TRANSFER) });
+    const tgRes = await fetchTgFile(tg_file_id);
     if (!tgRes.ok) return res.status(502).json({ error: 'TG download failed' });
 
     const inputBuffer = Buffer.from(await tgRes.arrayBuffer());
@@ -583,9 +569,7 @@ async function processJob(jobId) {
 
   try {
     // Stream the source file from TG to disk instead of holding it in memory (videos can be up to 2GB)
-    const filePath = await getFilePath(job.tg_file_id);
-    const url = `${TG_API}/file/bot${BOT_TOKEN}/${filePath}`;
-    const tgRes = await fetch(url, { signal: AbortSignal.timeout(TIMEOUT_TRANSFER) });
+    const tgRes = await fetchTgFile(job.tg_file_id);
     if (!tgRes.ok || !tgRes.body) throw new Error(`TG download failed: ${tgRes.status}`);
     await pipeline(Readable.fromWeb(tgRes.body), createWriteStream(inputPath));
 
@@ -719,6 +703,39 @@ async function getFilePath(fileId) {
   const data = await res.json();
   if (!data.ok || !data.result?.file_path) throw new Error('No file_path in getFile response');
   return data.result.file_path;
+}
+
+// Download a Telegram file and return a fetch Response, optionally for a byte range.
+// A Local Bot API server started with --local does not serve files over HTTP: getFile returns an absolute path
+// on its own disk instead. In that case the file is read from disk, so the Bot API's data directory must be
+// mounted into this container at the same path (see docker-compose.yml).
+async function fetchTgFile(fileId, range) {
+  const filePath = await getFilePath(fileId);
+  if (!isAbsolute(filePath)) {
+    const headers = range ? { 'Range': `bytes=${range.start}-${range.end}` } : {};
+    return fetch(`${TG_API}/file/bot${BOT_TOKEN}/${filePath}`, { headers, signal: AbortSignal.timeout(TIMEOUT_TRANSFER) });
+  }
+
+  let size;
+  try {
+    size = (await stat(filePath)).size;
+  } catch (err) {
+    throw new Error(`The Bot API runs in --local mode and returned ${filePath}, which this container cannot read ` +
+      `(${err.code}). Mount the Bot API data directory into the processor at the same path.`);
+  }
+  const headers = { 'Content-Type': 'application/octet-stream' };
+  if (!range) {
+    headers['Content-Length'] = String(size);
+    return new Response(Readable.toWeb(createReadStream(filePath)), { status: 200, headers });
+  }
+  const start = Number(range.start);
+  const end = Math.min(Number(range.end), size - 1);
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || start > end) {
+    return new Response(null, { status: 416, headers: { 'Content-Range': `bytes */${size}` } });
+  }
+  headers['Content-Length'] = String(end - start + 1);
+  headers['Content-Range'] = `bytes ${start}-${end}/${size}`;
+  return new Response(Readable.toWeb(createReadStream(filePath, { start, end })), { status: 206, headers });
 }
 
 app.listen(PORT, () => {
