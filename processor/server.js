@@ -1,8 +1,9 @@
 import express from 'express';
-import { createReadStream, createWriteStream, unlinkSync, existsSync, mkdirSync } from 'fs';
+import { createReadStream, createWriteStream, unlinkSync, existsSync, mkdirSync, openAsBlob } from 'fs';
 import { readFile, writeFile, unlink, stat, open as openFile } from 'fs/promises';
-import { createDecipheriv, createCipheriv, randomUUID, randomBytes, createHash } from 'crypto';
+import { createDecipheriv, createCipheriv, randomUUID, randomBytes, createHash, timingSafeEqual } from 'crypto';
 import { join } from 'path';
+import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
@@ -16,6 +17,19 @@ const BOT_TOKEN = process.env.TG_BOT_TOKEN;
 const AUTH_SECRET = process.env.AUTH_SECRET;
 const TG_API = process.env.TG_LOCAL_API || 'https://api.telegram.org';
 const TEMP_DIR = process.env.TEMP_DIR || '/tmp/tg-s3-processor';
+
+// Which automatic media jobs run after an upload: 'all' (default), 'images' (no video transcoding) or 'none'.
+// Video transcoding is the only job whose memory use grows with the file, so small servers should use 'images' or 'none'.
+const MEDIA_JOBS = (process.env.MEDIA_JOBS || 'all').toLowerCase();
+if (!['all', 'images', 'none'].includes(MEDIA_JOBS)) {
+  console.error(`FATAL: MEDIA_JOBS must be all, images or none (got "${MEDIA_JOBS}")`);
+  process.exit(1);
+}
+function isJobTypeEnabled(jobType) {
+  if (MEDIA_JOBS === 'none') return false;
+  if (MEDIA_JOBS === 'images') return jobType !== 'video_transcode';
+  return true;
+}
 
 // Timeout constants for TG API calls (server-side protection against hangs)
 const TIMEOUT_API = 30_000;            // 30s for getFile and similar API method calls
@@ -35,7 +49,7 @@ function authMiddleware(req, res, next) {
   if (!auth) return res.status(401).json({ error: 'Unauthorized' });
   const expected = `Bearer ${AUTH_SECRET}`;
   if (auth.length !== expected.length ||
-      !require('crypto').timingSafeEqual(Buffer.from(auth), Buffer.from(expected))) {
+      !timingSafeEqual(Buffer.from(auth), Buffer.from(expected))) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
   next();
@@ -53,24 +67,32 @@ const JOB_TTL_MS = 30 * 60 * 1000; // 30 minutes
 setInterval(() => {
   const now = Date.now();
   for (const [id, job] of jobs) {
-    if ((job.status === 'completed' || job.status === 'failed') && job.finishedAt && now - job.finishedAt > JOB_TTL_MS) {
+    if ((job.status === 'completed' || job.status === 'failed' || job.status === 'skipped') && job.finishedAt && now - job.finishedAt > JOB_TTL_MS) {
       jobs.delete(id);
     }
   }
 }, 5 * 60 * 1000); // Every 5 minutes
 
+// Jobs run one at a time: each holds a decoded image or an ffmpeg process, so running them in parallel multiplies
+// the peak memory by the number of uploads that arrive together.
+let jobChain = Promise.resolve();
+
 app.post('/api/jobs', async (req, res) => {
   const { bucket, key, tg_file_id, job_type } = req.body;
   const jobId = randomUUID();
 
+  if (!isJobTypeEnabled(job_type)) {
+    jobs.set(jobId, { status: 'skipped', bucket, key, tg_file_id, job_type, results: null, error: null, finishedAt: Date.now() });
+    return res.json({ jobId, status: 'skipped' });
+  }
+
   jobs.set(jobId, { status: 'queued', bucket, key, tg_file_id, job_type, results: null, error: null });
   res.json({ jobId, status: 'queued' });
 
-  // Process async
-  processJob(jobId).catch(err => {
+  jobChain = jobChain.then(() => processJob(jobId).catch(err => {
     const job = jobs.get(jobId);
     if (job) { job.status = 'failed'; job.error = err.message; job.finishedAt = Date.now(); }
-  });
+  }));
 });
 
 app.get('/api/jobs/:id', (req, res) => {
@@ -554,54 +576,51 @@ async function processJob(jobId) {
   const job = jobs.get(jobId);
   job.status = 'processing';
 
-  // Download source file from TG
-  const filePath = await getFilePath(job.tg_file_id);
-  const url = `${TG_API}/file/bot${BOT_TOKEN}/${filePath}`;
-  const tgRes = await fetch(url, { signal: AbortSignal.timeout(TIMEOUT_TRANSFER) });
-  if (!tgRes.ok) throw new Error(`TG download failed: ${tgRes.status}`);
-  const inputBuffer = Buffer.from(await tgRes.arrayBuffer());
-
+  const inputPath = join(TEMP_DIR, `${jobId}-input`);
+  const outputPath = join(TEMP_DIR, `${jobId}-output.mp4`);
+  const posterPath = join(TEMP_DIR, `${jobId}-poster.jpg`);
   const results = [];
 
-  switch (job.job_type) {
-    case 'image_convert': {
-      // HEIC -> JPEG full size
-      const fullJpeg = await sharp(inputBuffer).jpeg({ quality: 90, mozjpeg: true }).toBuffer();
-      results.push(await uploadDerivative(job, 'full.jpg', fullJpeg, 'image/jpeg'));
+  try {
+    // Stream the source file from TG to disk instead of holding it in memory (videos can be up to 2GB)
+    const filePath = await getFilePath(job.tg_file_id);
+    const url = `${TG_API}/file/bot${BOT_TOKEN}/${filePath}`;
+    const tgRes = await fetch(url, { signal: AbortSignal.timeout(TIMEOUT_TRANSFER) });
+    if (!tgRes.ok || !tgRes.body) throw new Error(`TG download failed: ${tgRes.status}`);
+    await pipeline(Readable.fromWeb(tgRes.body), createWriteStream(inputPath));
 
-      // WebP thumbnail 400px
-      const thumb400 = await sharp(inputBuffer)
-        .resize(400, null, { withoutEnlargement: true })
-        .webp({ quality: 80 })
-        .toBuffer();
-      results.push(await uploadDerivative(job, 'thumb_400.webp', thumb400, 'image/webp'));
+    switch (job.job_type) {
+      case 'image_convert': {
+        // HEIC -> JPEG full size
+        const fullJpeg = await sharp(inputPath).jpeg({ quality: 90, mozjpeg: true }).toBuffer();
+        results.push(await uploadDerivative(job, 'full.jpg', fullJpeg, 'image/jpeg'));
 
-      // WebP thumbnail 200px
-      const thumb200 = await sharp(inputBuffer)
-        .resize(200, null, { withoutEnlargement: true })
-        .webp({ quality: 75 })
-        .toBuffer();
-      results.push(await uploadDerivative(job, 'thumb_200.webp', thumb200, 'image/webp'));
+        // WebP thumbnail 400px
+        const thumb400 = await sharp(inputPath)
+          .resize(400, null, { withoutEnlargement: true })
+          .webp({ quality: 80 })
+          .toBuffer();
+        results.push(await uploadDerivative(job, 'thumb_400.webp', thumb400, 'image/webp'));
 
-      // Extract metadata
-      const metadata = await sharp(inputBuffer).metadata();
-      const metaJson = JSON.stringify({
-        width: metadata.width, height: metadata.height,
-        format: metadata.format, density: metadata.density,
-        hasAlpha: metadata.hasAlpha, space: metadata.space,
-      });
-      results.push(await uploadDerivative(job, 'metadata.json', Buffer.from(metaJson), 'application/json'));
-      break;
-    }
+        // WebP thumbnail 200px
+        const thumb200 = await sharp(inputPath)
+          .resize(200, null, { withoutEnlargement: true })
+          .webp({ quality: 75 })
+          .toBuffer();
+        results.push(await uploadDerivative(job, 'thumb_200.webp', thumb200, 'image/webp'));
 
-    case 'video_transcode': {
-      const inputPath = join(TEMP_DIR, `${jobId}-input`);
-      const outputPath = join(TEMP_DIR, `${jobId}-output.mp4`);
-      const posterPath = join(TEMP_DIR, `${jobId}-poster.jpg`);
+        // Extract metadata
+        const metadata = await sharp(inputPath).metadata();
+        const metaJson = JSON.stringify({
+          width: metadata.width, height: metadata.height,
+          format: metadata.format, density: metadata.density,
+          hasAlpha: metadata.hasAlpha, space: metadata.space,
+        });
+        results.push(await uploadDerivative(job, 'metadata.json', Buffer.from(metaJson), 'application/json'));
+        break;
+      }
 
-      try {
-        await writeFile(inputPath, inputBuffer);
-
+      case 'video_transcode': {
         // Transcode to H.264 MP4
         await execFileAsync('ffmpeg', [
           '-i', inputPath,
@@ -618,32 +637,32 @@ async function processJob(jobId) {
           '-y', posterPath,
         ]);
 
-        const mp4Buffer = await readFile(outputPath);
-        results.push(await uploadDerivative(job, 'video.mp4', mp4Buffer, 'video/mp4'));
+        // Upload the MP4 from disk; it can be as large as the source
+        results.push(await uploadDerivative(job, 'video.mp4', { path: outputPath }, 'video/mp4'));
 
         if (existsSync(posterPath)) {
           const posterBuffer = await readFile(posterPath);
           results.push(await uploadDerivative(job, 'poster.jpg', posterBuffer, 'image/jpeg'));
         }
-      } finally {
-        for (const p of [inputPath, outputPath, posterPath]) {
-          try { unlinkSync(p); } catch {}
-        }
+        break;
       }
-      break;
+
+      case 'live_photo': {
+        // Input expected as HEIC; MOV should be uploaded separately with a paired key
+        const jpeg = await sharp(inputPath).jpeg({ quality: 90 }).toBuffer();
+        results.push(await uploadDerivative(job, 'still.jpg', jpeg, 'image/jpeg'));
+
+        const thumb = await sharp(inputPath)
+          .resize(400, null, { withoutEnlargement: true })
+          .webp({ quality: 80 })
+          .toBuffer();
+        results.push(await uploadDerivative(job, 'thumb_400.webp', thumb, 'image/webp'));
+        break;
+      }
     }
-
-    case 'live_photo': {
-      // Input expected as HEIC; MOV should be uploaded separately with a paired key
-      const jpeg = await sharp(inputBuffer).jpeg({ quality: 90 }).toBuffer();
-      results.push(await uploadDerivative(job, 'still.jpg', jpeg, 'image/jpeg'));
-
-      const thumb = await sharp(inputBuffer)
-        .resize(400, null, { withoutEnlargement: true })
-        .webp({ quality: 80 })
-        .toBuffer();
-      results.push(await uploadDerivative(job, 'thumb_400.webp', thumb, 'image/webp'));
-      break;
+  } finally {
+    for (const p of [inputPath, outputPath, posterPath]) {
+      try { unlinkSync(p); } catch {}
     }
   }
 
@@ -652,13 +671,17 @@ async function processJob(jobId) {
   job.finishedAt = Date.now();
 }
 
-async function uploadDerivative(job, derivativeName, buffer, contentType) {
+// `source` is a Buffer, or { path } for a file on disk that should not be loaded into memory
+async function uploadDerivative(job, derivativeName, source, contentType) {
   const key = `${job.key}._derivatives/${derivativeName}`;
 
   const form = new FormData();
   if (!process.env.DEFAULT_CHAT_ID) throw new Error('DEFAULT_CHAT_ID is not configured');
+  const blob = Buffer.isBuffer(source)
+    ? new Blob([source], { type: contentType })
+    : await openAsBlob(source.path, { type: contentType });
   form.append('chat_id', process.env.DEFAULT_CHAT_ID);
-  form.append('document', new Blob([buffer], { type: contentType }), derivativeName);
+  form.append('document', blob, derivativeName);
   form.append('caption', key);
 
   const tgRes = await fetch(`${TG_API}/bot${BOT_TOKEN}/sendDocument`, {
@@ -679,7 +702,7 @@ async function uploadDerivative(job, derivativeName, buffer, contentType) {
   return {
     key,
     contentType,
-    size: buffer.length,
+    size: blob.size,
     tgFileId: doc.file_id,
     tgMessageId: data.result.message_id,
   };

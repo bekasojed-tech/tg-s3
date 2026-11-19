@@ -48,6 +48,7 @@ services:
       - TG_LOCAL_API=${TG_LOCAL_API:-https://api.telegram.org}
       - DEFAULT_CHAT_ID=${DEFAULT_CHAT_ID}
       - TEMP_DIR=/tmp/tg-s3
+      - MEDIA_JOBS=${MEDIA_JOBS:-all}
     volumes:
       - processor-data:/tmp/tg-s3
     deploy:
