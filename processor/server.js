@@ -738,6 +738,9 @@ async function fetchTgFile(fileId, range) {
   return new Response(Readable.toWeb(createReadStream(filePath, { start, end })), { status: 206, headers });
 }
 
-app.listen(PORT, () => {
-  console.log(`tg-s3-processor running on port ${PORT}`);
+// HOST limits which interface the processor listens on. Leave it unset inside Docker's default bridge network;
+// set it to 127.0.0.1 when the container uses the host network and a local tunnel connector reaches it.
+const HOST = process.env.HOST || '0.0.0.0';
+app.listen(PORT, HOST, () => {
+  console.log(`tg-s3-processor running on ${HOST}:${PORT}`);
 });

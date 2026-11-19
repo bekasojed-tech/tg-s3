@@ -49,6 +49,8 @@ services:
       - DEFAULT_CHAT_ID=${DEFAULT_CHAT_ID}
       - TEMP_DIR=/tmp/tg-s3
       - MEDIA_JOBS=${MEDIA_JOBS:-all}
+      # Interface to listen on; keep 0.0.0.0 here so the tunnel container can reach it over the compose network
+      - HOST=${PROCESSOR_HOST:-0.0.0.0}
     volumes:
       - processor-data:/tmp/tg-s3
       # The Local Bot API (--local) returns file paths on its own disk instead of serving files over HTTP,
