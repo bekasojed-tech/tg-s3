@@ -21,6 +21,7 @@ import { handleWebhook } from './bot/webhook';
 import { MetadataStore } from './storage/metadata';
 import { TelegramClient } from './telegram/client';
 import { cleanR2Cache } from './handlers/get-object';
+import { recountR2Usage, r2BudgetBytes } from './storage/r2-budget';
 import { renderMiniApp } from './bot/miniapp';
 
 export default {
@@ -294,6 +295,14 @@ export default {
       r2Cleaned = await cleanR2Cache(env, store, 20);
     } catch (e) { console.error('Cron: cleanR2Cache failed:', e); }
 
+    // R2 budget: replace the running total with the bucket's real size (after the stale entries above are gone)
+    let r2Usage = 'unknown';
+    try {
+      const usage = await recountR2Usage(env);
+      r2Usage = `${(usage.totalBytes / 1e9).toFixed(2)} GB in ${usage.objectCount} objects` +
+        `${usage.complete ? '' : ' (partial listing, counter kept)'} of ${(r2BudgetBytes(env) / 1e9).toFixed(0)} GB budget`;
+    } catch (e) { console.error('Cron: recountR2Usage failed:', e); }
+
     let expiredAttempts = 0;
     try {
       expiredAttempts = await store.cleanExpiredPasswordAttempts();
@@ -329,7 +338,7 @@ export default {
       }
     } catch (e) { console.error('Cron: lifecycle evaluation failed:', e); }
 
-    console.log(`Cron cleanup: ${expiredShares} expired shares, ${orphanedShares} orphaned shares, ${staleUploads} stale multipart uploads, ${inconsistent} inconsistent objects, ${r2Cleaned} stale R2 cache entries, ${expiredAttempts} expired password attempts, ${orphanedChunks} orphaned chunks, ${lifecycleDeleted} lifecycle-expired objects`);
+    console.log(`Cron cleanup: ${expiredShares} expired shares, ${orphanedShares} orphaned shares, ${staleUploads} stale multipart uploads, ${inconsistent} inconsistent objects, ${r2Cleaned} stale R2 cache entries (R2 cache: ${r2Usage}),${expiredAttempts} expired password attempts, ${orphanedChunks} orphaned chunks, ${lifecycleDeleted} lifecycle-expired objects`);
   },
 };
 

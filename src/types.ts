@@ -8,6 +8,8 @@ export interface Env {
   S3_REGION: string;
   // Optional R2 bucket for hot file caching
   CACHE?: R2Bucket;
+  // Size limit of the R2 cache in GB (decimal); defaults to 8, under R2's free 10 GB
+  R2_CACHE_BUDGET_GB?: string;
   // Worker public URL for CDN cache purging in cron (e.g. https://tg-s3.example.com)
   WORKER_URL?: string;
   // SSE-S3 master key (base64-encoded 32 bytes, generated with: openssl rand -base64 32)

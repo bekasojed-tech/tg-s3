@@ -7,6 +7,7 @@ import { parseRange, isImageContentType, etagMatches, strip304Headers, buildResp
 import { errorResponse } from '../xml/builder';
 import { BOT_API_GETFILE_LIMIT, R2_CACHE_MIN_SIZE, R2_CACHE_MAX_SIZE, CACHE_CONTROL_IMMUTABLE } from '../constants';
 import { VpsClient } from '../media/vps-client';
+import { reserveR2Space, releaseR2Space } from '../storage/r2-budget';
 import { parseSseCHeaders, validateKeyMd5, decrypt, isEncrypted, getStoredKeyMd5, addSseResponseHeaders, SseCError, isEncryptedS3, decryptS3, addSseS3ResponseHeaders } from '../utils/sse';
 
 const MAX_DIRECT_DOWNLOAD = BOT_API_GETFILE_LIMIT;
@@ -282,11 +283,21 @@ export async function handleGetObject(s3: S3Request, env: Env, ctx?: ExecutionCo
     const cacheUrl = cacheKeyUrl(s3.url.origin, s3.bucket, s3.key);
     ctx.waitUntil(caches.default.put(new Request(cacheUrl), response.clone()).catch(e => console.error('CDN cache put failed:', e)));
     // Store to R2 persistent cache (only for files within cacheable size range)
+    // A write happens only if it fits in the R2 budget, so the cache stays within the free tier
     if (env.CACHE && isR2Cacheable(obj.size)) {
-      ctx.waitUntil(env.CACHE.put(r2CacheKey(s3.bucket, s3.key), data, {
-        customMetadata: { etag: obj.etag },
-        httpMetadata: { contentType: obj.content_type },
-      }).catch(e => console.error('R2 cache put failed:', e)));
+      const r2 = env.CACHE;
+      ctx.waitUntil((async () => {
+        if (!(await reserveR2Space(env, obj.size))) return;
+        try {
+          await r2.put(r2CacheKey(s3.bucket, s3.key), data, {
+            customMetadata: { etag: obj.etag },
+            httpMetadata: { contentType: obj.content_type },
+          });
+        } catch (e) {
+          console.error('R2 cache put failed:', e);
+          await releaseR2Space(env, obj.size);
+        }
+      })());
     }
   }
   return response;
