@@ -1,7 +1,8 @@
 name = "tg-s3"
 main = "src/index.ts"
 compatibility_date = "2026-03-15"
-workers_dev = true
+workers_dev = false
+routes = [{ pattern = "s3.ashkerizan.org.uk", custom_domain = true }]
 preview_urls = false
 
 [vars]
@@ -10,7 +11,7 @@ S3_REGION = "us-east-1"
 [[d1_databases]]
 binding = "DB"
 database_name = "tg-s3-db"
-database_id = ""
+database_id = "e5aafacb-10cf-4298-bca8-94d5931a87b0"
 migrations_dir = "migrations"
 
 [[r2_buckets]]
