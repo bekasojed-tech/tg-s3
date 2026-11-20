@@ -162,6 +162,7 @@ app.post('/api/proxy/put', async (req, res) => {
     const form = new FormData();
     form.append('chat_id', chatId);
     form.append('document', fileBlob, filename);
+    form.append('disable_content_type_detection', 'true'); // keep .webp etc. a document, not a sticker
     if (messageThreadId) form.append('message_thread_id', messageThreadId);
 
     const tgRes = await fetch(`${TG_API}/bot${BOT_TOKEN}/sendDocument`, {
@@ -281,6 +282,7 @@ app.post('/api/proxy/put-full', async (req, res) => {
     const form = new FormData();
     form.append('chat_id', chatId);
     form.append('document', fileBlob, filename);
+    form.append('disable_content_type_detection', 'true'); // keep .webp etc. a document, not a sticker
     if (messageThreadId) form.append('message_thread_id', messageThreadId);
 
     const tgRes = await fetch(`${TG_API}/bot${BOT_TOKEN}/sendDocument`, {
@@ -489,6 +491,7 @@ app.post('/api/proxy/consolidate', async (req, res) => {
     const form = new FormData();
     form.append('chat_id', chat_id);
     form.append('document', fileBlob, filename);
+    form.append('disable_content_type_detection', 'true'); // keep .webp etc. a document, not a sticker
     if (message_thread_id) form.append('message_thread_id', message_thread_id.toString());
 
     const tgRes = await fetch(`${TG_API}/bot${BOT_TOKEN}/sendDocument`, {
@@ -666,6 +669,7 @@ async function uploadDerivative(job, derivativeName, source, contentType) {
     : await openAsBlob(source.path, { type: contentType });
   form.append('chat_id', process.env.DEFAULT_CHAT_ID);
   form.append('document', blob, derivativeName);
+  form.append('disable_content_type_detection', 'true'); // keep .webp etc. a document, not a sticker
   form.append('caption', key);
 
   const tgRes = await fetch(`${TG_API}/bot${BOT_TOKEN}/sendDocument`, {

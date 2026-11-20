@@ -18,6 +18,8 @@ export class TelegramClient {
       const form = new FormData();
       form.append('chat_id', chatId);
       form.append('document', new Blob([file], { type: contentType }), filename);
+      // Keep every file a document: without this Telegram turns e.g. .webp into a sticker (no `document` in the reply)
+      form.append('disable_content_type_detection', 'true');
       if (caption) form.append('caption', caption);
       if (messageThreadId) form.append('message_thread_id', messageThreadId.toString());
 
