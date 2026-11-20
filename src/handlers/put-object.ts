@@ -9,7 +9,7 @@ import { purgeCdnCache, purgeR2Cache } from './get-object';
 import { deleteDerivatives, deleteChunks } from './delete-object';
 import { parseSseCHeaders, validateKeyMd5, encrypt, addSseMetadata, SseCError, encryptS3, addSseS3Metadata } from '../utils/sse';
 import { BOT_API_GETFILE_LIMIT, VPS_SINGLE_FILE_MAX, WORKER_BODY_LIMIT } from '../constants';
-import { VpsClient } from '../media/vps-client';
+import { VpsClient, VpsError } from '../media/vps-client';
 
 /** Parse x-amz-tagging header and validate per S3 spec (key≤128, value≤256, ≤10 tags). */
 function parseTaggingHeader(header: string | null): { key: string; value: string }[] | null {
@@ -97,7 +97,9 @@ export async function handlePutObject(s3: S3Request, env: Env, ctx: ExecutionCon
   const estimatedSize = decodedLength || contentLength;
   const isChunked = (s3.headers.get('x-amz-content-sha256') || '').startsWith('STREAMING-');
 
-  if (estimatedSize > BOT_API_GETFILE_LIMIT && env.VPS_URL && !isChunked && s3.body) {
+  // With a VPS, every non-empty upload streams there: hashing a body in the Worker costs far more than the free
+  // plan's 10 ms of CPU per request, while forwarding bytes costs almost nothing. The VPS decodes aws-chunked bodies.
+  if (env.VPS_URL && s3.body && estimatedSize > 0) {
     if (estimatedSize > VPS_SINGLE_FILE_MAX) {
       return errorResponse(400, 'EntityTooLarge', `File size exceeds maximum 2GB limit.`);
     }
@@ -248,7 +250,7 @@ async function handleLargePutViaVps(
   parsedTags: { key: string; value: string }[] | null,
 ): Promise<Response> {
   const vps = new VpsClient(env);
-  const contentLength = parseInt(s3.headers.get('content-length') || s3.headers.get('x-amz-decoded-content-length') || '0', 10);
+  const stream = streamParams(s3);
 
   let sseKeyBase64: string | undefined;
   let sseS3KeyBase64: string | undefined;
@@ -257,16 +259,25 @@ async function handleLargePutViaVps(
 
   const contentMd5 = s3.headers.get('content-md5') || undefined;
 
-  const vpsRes = await vps.proxyPutFull(
-    s3.body!,
-    bucket.tg_chat_id, s3.key, contentType, contentLength,
-    {
-      messageThreadId: bucket.tg_topic_id,
-      sseKeyBase64,
-      sseS3KeyBase64,
-      contentMd5,
-    },
-  );
+  let vpsRes: Response;
+  try {
+    vpsRes = await vps.proxyPutFull(
+      s3.body!,
+      bucket.tg_chat_id, s3.key, contentType, stream.rawLength,
+      {
+        messageThreadId: bucket.tg_topic_id,
+        sseKeyBase64,
+        sseS3KeyBase64,
+        contentMd5,
+        contentSha256: stream.contentSha256,
+        expectedSize: stream.expectedSize,
+        awsChunked: stream.awsChunked,
+      },
+    );
+  } catch (e) {
+    if (e instanceof VpsError) return errorResponse(e.toS3Status(), e.code, e.message, undefined, e.retryAfter);
+    throw e;
+  }
 
   const result = await vpsRes.json() as {
     etag: string; tgChatId: string; tgMessageId: number;
@@ -313,6 +324,20 @@ async function handleLargePutViaVps(
   }
   if (useSseS3) putHeaders['x-amz-server-side-encryption'] = 'AES256';
   return new Response(null, { status: 200, headers: putHeaders });
+}
+
+/**
+ * How to forward a request body to the VPS without reading it: its raw length, whether it is aws-chunked,
+ * and the decoded size and SHA-256 the VPS should verify.
+ */
+export function streamParams(s3: S3Request): { rawLength: number; awsChunked: boolean; expectedSize?: number; contentSha256?: string } {
+  const sha = s3.headers.get('x-amz-content-sha256') || '';
+  const awsChunked = sha.startsWith('STREAMING-') || (s3.headers.get('content-encoding') || '').includes('aws-chunked');
+  const rawLength = parseInt(s3.headers.get('content-length') || '0', 10) || 0;
+  const decoded = parseInt(s3.headers.get('x-amz-decoded-content-length') || '0', 10) || 0;
+  const expectedSize = awsChunked ? (decoded || undefined) : (rawLength || undefined);
+  const contentSha256 = /^[0-9a-f]{64}$/i.test(sha) ? sha.toLowerCase() : undefined;
+  return { rawLength, awsChunked, expectedSize, contentSha256 };
 }
 
 async function triggerMediaProcessing(

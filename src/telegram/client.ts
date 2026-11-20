@@ -89,6 +89,23 @@ export class TelegramClient {
     return res;
   }
 
+  /** Deletes up to 100 messages in one call (Bot API deleteMessages). */
+  async deleteMessages(chatId: string, messageIds: number[]): Promise<boolean> {
+    if (messageIds.length === 0) return true;
+    return this.withRetry(async () => {
+      const res = await fetch(`${this.baseUrl}/deleteMessages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, message_ids: messageIds.slice(0, 100) }),
+        signal: AbortSignal.timeout(TG_API_TIMEOUT),
+      });
+      await this.checkFloodWait(res);
+      if (!res.ok) return false;
+      const data = await res.json() as { ok: boolean };
+      return data.ok;
+    });
+  }
+
   async deleteMessage(chatId: string, messageId: number): Promise<boolean> {
     return this.withRetry(async () => {
       const res = await fetch(`${this.baseUrl}/deleteMessage`, {

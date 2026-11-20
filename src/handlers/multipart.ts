@@ -1,16 +1,16 @@
-import type { Env, S3Request } from '../types';
+import type { Env, S3Request, BucketRow, MultipartUploadRow, MultipartPartRow } from '../types';
 import { MetadataStore } from '../storage/metadata';
 import { uploadToTelegram, RateLimitError, FileTooLargeError, type UploadResult } from '../telegram/upload';
 import { downloadFromTelegram } from '../telegram/download';
 import { TelegramClient } from '../telegram/client';
 import { computeEtag, computeMultipartEtag, sha256Hex } from '../utils/crypto';
 import { extractUserMetadata, extractSystemMetadata, etagMatches } from '../utils/headers';
-import { readBody } from './put-object';
+import { readBody, streamParams } from './put-object';
 import { deleteDerivatives, deleteChunks } from './delete-object';
 import { purgeCdnCache, purgeR2Cache } from './get-object';
-import { initiateMultipartXml, completeMultipartXml, listPartsXml, listMultipartUploadsXml, copyPartResultXml, xmlResponse, errorResponse } from '../xml/builder';
+import { initiateMultipartXml, completeMultipartXml, listPartsXml, listMultipartUploadsXml, copyPartResultXml, xmlResponse, errorResponse, errorXml } from '../xml/builder';
 import { BOT_API_GETFILE_LIMIT, VPS_SINGLE_FILE_MAX, S3_MIN_PART_SIZE, S3_MAX_KEYS_DEFAULT, S3_MAX_PART_NUMBER } from '../constants';
-import { VpsClient } from '../media/vps-client';
+import { VpsClient, VpsError } from '../media/vps-client';
 import { parseCompleteMultipart } from '../xml/parser';
 import {
   parseSseCHeaders, validateKeyMd5, encrypt, decrypt, addSseMetadata, SseCError,
@@ -107,6 +107,43 @@ export async function handleUploadPart(s3: S3Request, env: Env, ctx: ExecutionCo
   const bucket = await store.getBucket(upload.bucket);
   if (!bucket) return errorResponse(404, 'NoSuchBucket', 'Bucket not found.');
 
+  const partFilename = `${upload.key}.part${partNumber.toString().padStart(4, '0')}`;
+  const partHeaders: Record<string, string> = {};
+  if (uploadSseMd5) {
+    partHeaders['x-amz-server-side-encryption-customer-algorithm'] = 'AES256';
+    partHeaders['x-amz-server-side-encryption-customer-key-MD5'] = uploadSseMd5;
+  }
+
+  // With a VPS, stream the part there: it hashes and verifies it, so the Worker stays within its CPU limit.
+  // Parts are stored unencrypted; SSE is applied when the parts are joined.
+  const stream = streamParams(s3);
+  if (env.VPS_URL && s3.body && (stream.expectedSize ?? stream.rawLength) > 0) {
+    let result: { etag: string; tgChatId: string; tgMessageId: number; tgFileId: string; size: number };
+    try {
+      const vpsRes = await new VpsClient(env).proxyPutFull(
+        s3.body, bucket.tg_chat_id, partFilename, 'application/octet-stream', stream.rawLength,
+        {
+          messageThreadId: bucket.tg_topic_id,
+          contentMd5: s3.headers.get('content-md5') || undefined,
+          contentSha256: stream.contentSha256,
+          expectedSize: stream.expectedSize,
+          awsChunked: stream.awsChunked,
+        },
+      );
+      result = await vpsRes.json();
+    } catch (e) {
+      if (e instanceof VpsError) return errorResponse(e.toS3Status(), e.code, e.message, undefined, e.retryAfter);
+      throw e;
+    }
+    const oldStreamedPart = await store.getMultipartPart(uploadId, partNumber);
+    await store.putMultipartPart({
+      uploadId, partNumber, size: result.size, etag: result.etag,
+      tgChatId: result.tgChatId, tgMessageId: result.tgMessageId, tgFileId: result.tgFileId,
+    });
+    if (oldStreamedPart) ctx.waitUntil(cleanupParts([oldStreamedPart], env));
+    return new Response(null, { status: 200, headers: { ...partHeaders, 'ETag': result.etag } });
+  }
+
   // Read part body (handles AWS chunked streaming format transparently)
   const bodyBuf = await readBody(s3);
   if (!bodyBuf || bodyBuf.byteLength === 0) return errorResponse(400, 'MissingContent', 'Request body is empty.');
@@ -172,14 +209,9 @@ export async function handleUploadPart(s3: S3Request, env: Env, ctx: ExecutionCo
     ctx.waitUntil(cleanupParts([oldPart], env));
   }
 
-  const partHeaders: Record<string, string> = { 'ETag': etag };
-  if (uploadSseMd5) {
-    partHeaders['x-amz-server-side-encryption-customer-algorithm'] = 'AES256';
-    partHeaders['x-amz-server-side-encryption-customer-key-MD5'] = uploadSseMd5;
-  }
   return new Response(null, {
     status: 200,
-    headers: partHeaders,
+    headers: { ...partHeaders, 'ETag': etag },
   });
 }
 
@@ -264,6 +296,13 @@ export async function handleCompleteMultipartUpload(s3: S3Request, env: Env, ctx
         uploadUseSseS3 = true;
       }
     } catch { /* ignore */ }
+  }
+
+  // With a VPS, it joins the parts in the background (minutes for large files) while this response streams
+  if (env.VPS_URL) {
+    return completeViaVpsJob(s3, env, ctx, store, uploadId, upload, bucket, sortedParts, dbParts, totalSize, {
+      sseKeyBase64: uploadSseKeyBase64, sseKeyMd5: uploadSseKeyMd5, useSseS3: uploadUseSseS3,
+    });
   }
 
   if (totalSize <= BOT_API_GETFILE_LIMIT) {
@@ -471,13 +510,121 @@ async function consolidateViaVps(
   return data as unknown as UploadResult;
 }
 
+/**
+ * CompleteMultipartUpload through a background job on the VPS. Joining a large file takes longer than Cloudflare
+ * lets a request wait for the VPS (~100 s), so the Worker polls the job in short requests. Meanwhile it streams a
+ * 200 response and sends a space every 10 s so the client does not time out; the result (or an <Error>) follows as
+ * the body, which S3 itself does for slow completions and S3 SDKs expect. On failure the upload is kept, so the
+ * client can retry; a retry rejoins the same job on the VPS instead of joining the parts again.
+ */
+function completeViaVpsJob(
+  s3: S3Request, env: Env, ctx: ExecutionContext, store: MetadataStore,
+  uploadId: string, upload: MultipartUploadRow, bucket: BucketRow,
+  sortedParts: MultipartPartRow[], allParts: MultipartPartRow[], totalSize: number,
+  sse: { sseKeyBase64: string | null; sseKeyMd5: string | null; useSseS3: boolean },
+): Response {
+  const encodedKey = upload.key.split('/').map(encodeURIComponent).join('/');
+  const location = `${s3.url.origin}/${encodeURIComponent(upload.bucket)}/${encodedKey}`;
+  const contentType = upload.content_type || 'application/octet-stream';
+  const headers: Record<string, string> = { 'Content-Type': 'application/xml' };
+  if (sse.sseKeyBase64 && sse.sseKeyMd5) {
+    headers['x-amz-server-side-encryption-customer-algorithm'] = 'AES256';
+    headers['x-amz-server-side-encryption-customer-key-MD5'] = sse.sseKeyMd5;
+  } else if (sse.useSseS3) {
+    headers['x-amz-server-side-encryption'] = 'AES256';
+  }
+  const sseOptions: { sseKeyBase64?: string; sseS3KeyBase64?: string } = {};
+  if (sse.sseKeyBase64) sseOptions.sseKeyBase64 = sse.sseKeyBase64;
+  else if (sse.useSseS3 && env.SSE_MASTER_KEY) sseOptions.sseS3KeyBase64 = env.SSE_MASTER_KEY;
+
+  const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+  const writer = writable.getWriter();
+  const enc = new TextEncoder();
+  const send = (s: string) => writer.write(enc.encode(s)).catch(() => { /* client went away */ });
+  const stripHead = (xml: string) => xml.replace(/^<\?xml[^>]*\?>\s*/, '');
+
+  const work = (async () => {
+    await send('<?xml version="1.0" encoding="UTF-8"?>\n');
+    const keepAlive = setInterval(() => { void send(' '); }, 10_000);
+    try {
+      const vps = new VpsClient(env);
+      const fileIds = sortedParts.map(p => p.tg_file_id);
+      const start = () => vps.consolidateJobStart(uploadId, fileIds, totalSize, bucket.tg_chat_id, upload.key, contentType, bucket.tg_topic_id, sseOptions);
+      let job = await start();
+      let restarts = 0;
+      const deadline = Date.now() + 30 * 60 * 1000;
+      while (job.status === 'running') {
+        if (Date.now() > deadline) throw new Error('Timed out waiting for the VPS to join the parts.');
+        const next = await vps.consolidateJobWait(uploadId, 50);
+        if (next) { job = next; continue; }
+        // The VPS restarted and lost the job: start it again (at most twice)
+        if (++restarts > 2) throw new Error('The VPS lost the consolidation job.');
+        job = await start();
+      }
+      if (job.status !== 'done' || !job.result) throw new Error(job.error || 'The VPS failed to join the parts.');
+      const r = job.result;
+      const etag = await computeMultipartEtag(sortedParts.map(p => p.etag));
+
+      const oldObj = await store.putObject({
+        bucket: upload.bucket, key: upload.key, size: totalSize, etag, contentType,
+        tgChatId: r.tgChatId, tgMessageId: r.tgMessageId, tgFileId: r.tgFileId, tgFileUniqueId: r.tgFileUniqueId,
+        userMetadata: (() => { try { return upload.user_metadata ? JSON.parse(upload.user_metadata) : undefined; } catch { return undefined; } })(),
+        systemMetadata: (() => {
+          let base: Record<string, string> = {};
+          if (upload.system_metadata) { try { base = JSON.parse(upload.system_metadata); } catch { /* ignore corrupt */ } }
+          base['_mp_part_sizes'] = JSON.stringify(sortedParts.map(p => p.size));
+          return base;
+        })(),
+      });
+      await store.deleteMultipartUpload(uploadId);
+
+      ctx.waitUntil(cleanupParts(allParts, env));
+      if (oldObj && oldObj.tg_file_id !== '__zero__' && oldObj.tg_file_id !== r.tgFileId) {
+        ctx.waitUntil(new TelegramClient(env).deleteMessage(oldObj.tg_chat_id, oldObj.tg_message_id).then(() => {}).catch(() => {}));
+      }
+      if (oldObj) {
+        ctx.waitUntil(deleteDerivatives(upload.bucket, upload.key, env, store));
+        ctx.waitUntil(deleteChunks(upload.bucket, upload.key, env, store));
+      }
+      ctx.waitUntil(purgeCdnCache(s3.url.origin, upload.bucket, upload.key));
+      ctx.waitUntil(purgeR2Cache(env, upload.bucket, upload.key));
+
+      clearInterval(keepAlive);
+      await send(stripHead(completeMultipartXml(upload.bucket, upload.key, etag, location)));
+    } catch (e) {
+      clearInterval(keepAlive);
+      const message = e instanceof Error ? e.message : String(e);
+      console.error(`CompleteMultipartUpload ${uploadId} failed (upload kept for retry):`, message);
+      await send(stripHead(errorXml('InternalError', `Joining the parts failed, retry the request: ${message}`)));
+    } finally {
+      clearInterval(keepAlive);
+      await writer.close().catch(() => {});
+    }
+  })();
+  ctx.waitUntil(work);
+  return new Response(readable, { status: 200, headers });
+}
+
+/** Deletes part messages, up to 100 per Telegram call (the free plan allows few subrequests per request). */
 async function cleanupParts(parts: Array<{ tg_chat_id: string; tg_message_id: number }>, env: Env): Promise<void> {
   const tg = new TelegramClient(env);
-  await Promise.allSettled(parts.map(p =>
-    tg.deleteMessage(p.tg_chat_id, p.tg_message_id).catch(e => {
-      console.warn(`Cleanup: failed to delete part message ${p.tg_message_id}:`, e);
-    })
-  ));
+  const byChat = new Map<string, number[]>();
+  for (const p of parts) {
+    if (!p.tg_message_id) continue;
+    const ids = byChat.get(p.tg_chat_id) ?? [];
+    ids.push(p.tg_message_id);
+    byChat.set(p.tg_chat_id, ids);
+  }
+  const calls: Promise<unknown>[] = [];
+  for (const [chatId, ids] of byChat) {
+    for (let i = 0; i < ids.length; i += 100) {
+      const batch = ids.slice(i, i + 100);
+      calls.push(tg.deleteMessages(chatId, batch).catch(e => {
+        console.warn(`Cleanup: failed to delete ${batch.length} part messages in ${chatId}:`, e);
+      }));
+    }
+  }
+  await Promise.allSettled(calls);
 }
 
 function stripQuotes(s: string): string {
